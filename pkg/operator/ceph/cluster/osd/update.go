@@ -54,6 +54,7 @@ type updateConfig struct {
 	osdsToSkipReconcile sets.Set[string] // these OSDs should not be updated during reconcile
 	osdDesiredState     map[int]*OSDInfo // the desired state of the OSDs determined during the reconcile
 	crushTree           *crushTree       // CRUSH tree used to restrict updates to a failure domain, fetched when first needed
+	failureDomain       *string          // failure domain to restrict updates to, determined when first needed
 }
 
 func (c *Cluster) newUpdateConfig(
@@ -70,6 +71,7 @@ func (c *Cluster) newUpdateConfig(
 		deployments,
 		osdsToSkipReconcile,
 		map[int]*OSDInfo{},
+		nil,
 		nil,
 	}
 }
@@ -123,8 +125,8 @@ func (c *updateConfig) updateExistingOSDs(errs *provisionErrors) {
 				c.queue.Push(osdIDQuery) // push back onto queue to make sure we retry it later
 				return
 			}
-		} else if failureDomain := c.cluster.spec.Storage.OSDUpdateFailureDomain; failureDomain != "" {
-			osdIDs = c.restrictToFailureDomain(osdIDQuery, osdIDs, failureDomain)
+		} else {
+			osdIDs = c.restrictToFailureDomain(osdIDQuery, osdIDs)
 		}
 	}
 
@@ -238,17 +240,27 @@ func (c *updateConfig) updateExistingOSDs(errs *provisionErrors) {
 	c.queue.Remove(osdIDs)
 }
 
-// restrictToFailureDomain drops the OSDs in osdIDs that are not in the same CRUSH bucket of type
-// failureDomain as osdIDQuery. 'osd ok-to-stop --max' fills its result from the queried OSD's
-// failure domain first, but then moves up the CRUSH tree and adds OSDs from other buckets when the
-// pools can tolerate it, which would make a batch of updates span more than one failure domain.
-// If the failure domain of osdIDQuery cannot be determined, for example because the CRUSH tree has
-// no bucket of that type above it, only osdIDQuery is returned. Updates then proceed one OSD at a
-// time, which makes a wrong setting noticeable without blocking the reconcile.
-func (c *updateConfig) restrictToFailureDomain(osdIDQuery int, osdIDs []int, failureDomain string) []int {
+// restrictToFailureDomain drops the OSDs in osdIDs that are not in the same CRUSH bucket as
+// osdIDQuery, for the bucket type returned by getFailureDomain. 'osd ok-to-stop --max' fills its
+// result from the queried OSD's failure domain first, but then moves up the CRUSH tree and adds
+// OSDs from other buckets when the pools can tolerate it, which would make a batch of updates span
+// more than one failure domain. If the failure domain of osdIDQuery cannot be determined, for
+// example because the CRUSH tree has no bucket of that type above it, only osdIDQuery is returned.
+// Updates then proceed one OSD at a time, which makes a wrong setting noticeable without blocking
+// the reconcile.
+func (c *updateConfig) restrictToFailureDomain(osdIDQuery int, osdIDs []int) []int {
 	namespace := c.cluster.clusterInfo.Namespace
 	if len(osdIDs) <= 1 {
 		return osdIDs
+	}
+
+	failureDomain, err := c.getFailureDomain(osdIDQuery)
+	if err != nil {
+		log.NamespacedError(namespace, logger, "failed to determine the failure domain to restrict OSD updates to; updating only OSD %d. %v", osdIDQuery, err)
+		return []int{osdIDQuery}
+	}
+	if failureDomain == "" {
+		return osdIDs // there are no pools whose failure domain could be crossed
 	}
 
 	tree, err := c.getCrushTree(osdIDQuery)
@@ -275,6 +287,93 @@ func (c *updateConfig) restrictToFailureDomain(osdIDQuery int, osdIDs []int, fai
 		log.NamespacedInfo(namespace, logger, "not updating OSDs %v together with OSD %d since they are outside its %s failure domain", dropped, osdIDQuery, failureDomain)
 	}
 	return restricted
+}
+
+// getFailureDomain returns the CRUSH bucket type to restrict each batch of OSD updates to. It is
+// storage.osdUpdateFailureDomain if set, and otherwise the narrowest failure domain used by the
+// CRUSH rules of the pools, which is determined the first time it is needed during this reconcile.
+// It returns an empty string if there are no pools.
+func (c *updateConfig) getFailureDomain(osdID int) (string, error) {
+	if failureDomain := c.cluster.spec.Storage.OSDUpdateFailureDomain; failureDomain != "" {
+		return failureDomain, nil
+	}
+	if c.failureDomain != nil {
+		return *c.failureDomain, nil
+	}
+
+	// 'ceph osd dump' has the CRUSH rule of every pool, but its output can be large, and is not
+	// valid JSON in some Ceph versions (https://tracker.ceph.com/issues/66215), so query the
+	// CRUSH rule of each pool instead.
+	pools, err := cephclient.ListPoolSummaries(c.cluster.context, c.cluster.clusterInfo)
+	if err != nil {
+		return "", err
+	}
+	failureDomain := ""
+	if len(pools) > 0 {
+		poolRules := make(map[string]string, len(pools)) // pool name -> CRUSH rule name
+		for _, pool := range pools {
+			rule, err := cephclient.GetPoolCrushRule(c.cluster.context, c.cluster.clusterInfo, pool.Name)
+			if err != nil {
+				return "", err
+			}
+			poolRules[pool.Name] = rule
+		}
+		rules, err := cephclient.GetCrushRules(c.cluster.context, c.cluster.clusterInfo)
+		if err != nil {
+			return "", err
+		}
+		tree, err := c.getCrushTree(osdID) // to order the CRUSH types
+		if err != nil {
+			return "", err
+		}
+		failureDomain, err = poolsFailureDomain(tree, rules, poolRules)
+		if err != nil {
+			return "", err
+		}
+	}
+	if failureDomain != "" {
+		log.NamespacedInfo(c.cluster.clusterInfo.Namespace, logger, "restricting OSD updates to the %q failure domain, the narrowest one used by the pools; set storage.osdUpdateFailureDomain to override it", failureDomain)
+	}
+	c.failureDomain = &failureDomain
+	return failureDomain, nil
+}
+
+// poolsFailureDomain returns the narrowest CRUSH bucket type that the CRUSH rules of the pools
+// choose items across, so that OSDs within a single bucket of that type hold copies of a PG that
+// the pools are designed to lose together. poolRules maps pool names to the names of their CRUSH
+// rules. The CRUSH types are ordered by their IDs in the CRUSH tree. It returns an empty string if
+// no rule has a choose step.
+func poolsFailureDomain(tree *crushTree, rules []cephclient.CrushRule, poolRules map[string]string) (string, error) {
+	typeIDs := map[string]int{}
+	for _, node := range tree.tree.Nodes {
+		typeIDs[node.Type] = node.TypeID
+	}
+	rulesByName := make(map[string]cephclient.CrushRule, len(rules))
+	for _, rule := range rules {
+		rulesByName[rule.Name] = rule
+	}
+
+	narrowest := ""
+	for pool, ruleName := range poolRules {
+		rule, ok := rulesByName[ruleName]
+		if !ok {
+			return "", errors.Errorf("CRUSH rule %q of pool %q does not exist", ruleName, pool)
+		}
+		for _, step := range rule.Steps {
+			// choose_firstn, chooseleaf_firstn, choose_indep, chooseleaf_indep, choosemsr
+			if !strings.HasPrefix(step.Operation, "choose") {
+				continue
+			}
+			id, ok := typeIDs[step.Type]
+			if !ok {
+				return "", errors.Errorf("CRUSH rule %q of pool %q chooses items of CRUSH type %q, which is not in the CRUSH tree", rule.Name, pool, step.Type)
+			}
+			if narrowest == "" || id < typeIDs[narrowest] {
+				narrowest = step.Type
+			}
+		}
+	}
+	return narrowest, nil
 }
 
 // getCrushTree returns the CRUSH tree, fetching it the first time it is needed during this

@@ -157,6 +157,24 @@ func GetPoolDetails(context *clusterd.Context, clusterInfo *ClusterInfo, name st
 	return ParsePoolDetails(output)
 }
 
+// GetPoolCrushRule returns the name of the CRUSH rule of the given pool.
+func GetPoolCrushRule(context *clusterd.Context, clusterInfo *ClusterInfo, name string) (string, error) {
+	args := []string{"osd", "pool", "get", name, "crush_rule"}
+	output, err := NewCephCommand(context, clusterInfo, args).Run()
+	if err != nil {
+		return "", errors.Wrapf(err, "failed to get crush rule of pool %q. %s", name, string(output))
+	}
+
+	var rule struct {
+		CrushRule string `json:"crush_rule"`
+	}
+	if err := json.Unmarshal(output, &rule); err != nil {
+		return "", errors.Wrapf(err, "failed to unmarshal crush rule of pool %q. %s", name, string(output))
+	}
+
+	return rule.CrushRule, nil
+}
+
 func ParsePoolDetails(in []byte) (CephStoragePoolDetails, error) {
 	// The response for osd pool get when passing var=all is actually malformed JSON similar to:
 	// {"pool":"rbd","size":1}{"pool":"rbd","min_size":2}...

@@ -183,6 +183,25 @@ func checkIfRuleIDExists(rules []ruleSpec, ID int) bool {
 	return false
 }
 
+// CrushRule is a CRUSH rule as reported by 'ceph osd crush rule dump'.
+type CrushRule = ruleSpec
+
+// GetCrushRules returns all CRUSH rules.
+func GetCrushRules(context *clusterd.Context, clusterInfo *ClusterInfo) ([]CrushRule, error) {
+	args := []string{"osd", "crush", "rule", "dump"}
+	buf, err := NewCephCommand(context, clusterInfo, args).Run()
+	if err != nil {
+		return nil, errors.Wrapf(err, "failed to get crush rules. %s", string(buf))
+	}
+
+	var rules []CrushRule
+	if err := json.Unmarshal(buf, &rules); err != nil {
+		return nil, errors.Wrapf(err, "failed to unmarshal crush rules. %s", string(buf))
+	}
+
+	return rules, nil
+}
+
 func getCrushRule(context *clusterd.Context, clusterInfo *ClusterInfo, name string) (ruleSpec, error) {
 	var rule ruleSpec
 	args := []string{"osd", "crush", "rule", "dump", name}

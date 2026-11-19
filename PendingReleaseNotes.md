@@ -5,6 +5,11 @@ Changes should *not* be included here if they are backported to previous release
 
 ## Breaking Changes
 
+- When updating OSDs in parallel, Rook now restricts each batch to a single bucket of the narrowest failure domain used
+  by the pools' CRUSH rules (typically `host`), so that an update never takes down OSDs from more than one failure
+  domain. Batches may be smaller than before, in particular for OSDs on portable PVCs, which each have their own `host`
+  bucket. Set `storage.osdUpdateFailureDomain` to choose another failure domain, or to `root` to keep the previous
+  behavior.
 
 ## Features
 

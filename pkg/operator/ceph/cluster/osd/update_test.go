@@ -80,9 +80,13 @@ func Test_updateExistingOSDs(t *testing.T) {
 		forceUpgradeIfUnhealthy bool
 		requiresHealthyPGs      bool
 		cephStatus              string
-		updateFailureDomain     string // spec.storage.osdUpdateFailureDomain
-		osdTreeOutput           string // output of 'ceph osd tree' (or an error if empty)
-		osdTreeCalls            int    // number of times 'ceph osd tree' was called
+		updateFailureDomain     string            // spec.storage.osdUpdateFailureDomain
+		osdTreeOutput           string            // output of 'ceph osd tree' (or an error if empty)
+		osdTreeCalls            int               // number of times 'ceph osd tree' was called
+		poolCrushRules          map[string]string // CRUSH rule names of the pools, by pool name
+		lspoolsFails            bool              // whether 'ceph osd lspools' fails
+		lspoolsCalls            int               // number of times 'ceph osd lspools' was called
+		crushRuleDumpOutput     string            // output of 'ceph osd crush rule dump' (or an error if empty)
 	)
 
 	// intermediates (created from inputs)
@@ -179,6 +183,31 @@ func Test_updateExistingOSDs(t *testing.T) {
 						return "", errors.Errorf("induced error getting osd tree")
 					}
 					return osdTreeOutput, nil
+				}
+				if args[1] == "lspools" {
+					lspoolsCalls++
+					if lspoolsFails {
+						return "", errors.Errorf("induced error listing pools")
+					}
+					pools := []cephclient.CephStoragePoolSummary{}
+					for name := range poolCrushRules {
+						pools = append(pools, cephclient.CephStoragePoolSummary{Name: name, Number: len(pools) + 1})
+					}
+					out, err := json.Marshal(pools)
+					return string(out), err
+				}
+				if args[1] == "pool" && args[2] == "get" && args[4] == "crush_rule" {
+					rule, ok := poolCrushRules[args[3]]
+					if !ok {
+						return "", errors.Errorf("pool %q does not exist", args[3])
+					}
+					return fmt.Sprintf(`{"pool":%q,"pool_id":1,"crush_rule":%q}`, args[3], rule), nil
+				}
+				if args[1] == "crush" && args[2] == "rule" && args[3] == "dump" {
+					if crushRuleDumpOutput == "" {
+						return "", errors.Errorf("induced error getting crush rules")
+					}
+					return crushRuleDumpOutput, nil
 				}
 				if args[1] == "crush" && args[2] == "get-device-class" {
 					return cephclientfake.OSDDeviceClassOutput(args[3]), nil
@@ -477,6 +506,84 @@ func Test_updateExistingOSDs(t *testing.T) {
 		assert.ElementsMatch(t, deploymentsUpdated, []string{deploymentName(2)})
 		assert.Equal(t, 2, osdTreeCalls) // the tree is fetched again
 		assert.Equal(t, 0, updateQueue.Len())
+	})
+
+	t.Run("ok to stop OSDs restricted to the failure domain of the pools by default", func(t *testing.T) {
+		clientset = fake.NewClientset()
+		// node0 holds OSDs 0, 3 and 6; node1 holds OSDs 1, 4 and 7
+		osdTreeOutput = cephclientfake.OsdTreeOutput(2, 3)
+		poolCrushRules = map[string]string{"replicapool": "replicated_host"}
+		lspoolsCalls = 0
+		crushRuleDumpOutput = testCrushRules
+		defer func() { osdTreeOutput, poolCrushRules, crushRuleDumpOutput = "", nil, "" }()
+		updateQueue = newUpdateQueueWithIDs(0, 1, 3)
+		existingDeployments = newExistenceListWithIDs(0, 1, 3)
+		forceUpgradeIfUnhealthy = false
+		updateInjectFailures = k8sutil.Failures{}
+		doSetup()
+		addDeploymentOnNode("node0", 0)
+		addDeploymentOnNode("node1", 1)
+		addDeploymentOnNode("node0", 3)
+
+		osdToBeQueried = 0
+		returnOkToStopIDs = []int{0, 3, 1}
+		updateConfig.updateExistingOSDs(errs)
+		assert.Zero(t, errs.len())
+		assert.ElementsMatch(t, deploymentsUpdated, []string{deploymentName(0), deploymentName(3)})
+		assert.Equal(t, 1, updateQueue.Len()) // OSD 1 is on another host and should remain queued
+
+		deploymentsUpdated = []string{}
+		osdToBeQueried = 1
+		returnOkToStopIDs = []int{1, 0}
+		updateConfig.updateExistingOSDs(errs)
+		assert.Zero(t, errs.len())
+		assert.ElementsMatch(t, deploymentsUpdated, []string{deploymentName(1)})
+		assert.Equal(t, 0, updateQueue.Len())
+		assert.Equal(t, 1, lspoolsCalls) // the failure domain is determined once
+	})
+
+	t.Run("explicit failure domain overrides the failure domain of the pools", func(t *testing.T) {
+		clientset = fake.NewClientset()
+		osdTreeOutput = cephclientfake.OsdTreeOutput(2, 3)
+		lspoolsCalls = 0
+		updateFailureDomain = "root"
+		defer func() { updateFailureDomain, osdTreeOutput = "", "" }()
+		updateQueue = newUpdateQueueWithIDs(0, 1, 3)
+		existingDeployments = newExistenceListWithIDs(0, 1, 3)
+		forceUpgradeIfUnhealthy = false
+		updateInjectFailures = k8sutil.Failures{}
+		doSetup()
+		addDeploymentOnNode("node0", 0)
+		addDeploymentOnNode("node1", 1)
+		addDeploymentOnNode("node0", 3)
+
+		osdToBeQueried = 0
+		returnOkToStopIDs = []int{0, 3, 1}
+		updateConfig.updateExistingOSDs(errs)
+		assert.Zero(t, errs.len())
+		assert.ElementsMatch(t, deploymentsUpdated, []string{deploymentName(0), deploymentName(1), deploymentName(3)})
+		assert.Equal(t, 0, updateQueue.Len())
+		assert.Equal(t, 0, lspoolsCalls)
+	})
+
+	t.Run("failure determining the failure domain of the pools updates only the queried OSD", func(t *testing.T) {
+		clientset = fake.NewClientset()
+		lspoolsFails = true
+		defer func() { lspoolsFails = false }()
+		updateQueue = newUpdateQueueWithIDs(0, 3)
+		existingDeployments = newExistenceListWithIDs(0, 3)
+		forceUpgradeIfUnhealthy = false
+		updateInjectFailures = k8sutil.Failures{}
+		doSetup()
+		addDeploymentOnNode("node0", 0)
+		addDeploymentOnNode("node0", 3)
+
+		osdToBeQueried = 0
+		returnOkToStopIDs = []int{0, 3}
+		updateConfig.updateExistingOSDs(errs)
+		assert.Zero(t, errs.len())
+		assert.ElementsMatch(t, deploymentsUpdated, []string{deploymentName(0)})
+		assert.Equal(t, 1, updateQueue.Len()) // OSD 3 should remain queued
 	})
 
 	t.Run("not ok to stop OSD", func(t *testing.T) {
@@ -1264,4 +1371,86 @@ func Test_osdsInSameBucket(t *testing.T) {
 	assert.ElementsMatch(t, []int{1, 4, 7}, sets.List(osds))
 	_, err = tree.osdsInSameBucket(4, "root")
 	assert.Error(t, err)
+}
+
+// testCrushRules has a replicated rule across hosts, an EC rule across hosts, a rule that spreads
+// replicas across zones and then hosts, a rule across racks, a rule that chooses no failure domain,
+// and a rule across datacenters.
+const testCrushRules = `[
+	{"rule_id": 1, "rule_name": "replicated_host", "steps": [
+		{"op": "take", "item": -1, "item_name": "default"},
+		{"op": "chooseleaf_firstn", "num": 0, "type": "host"},
+		{"op": "emit"}
+	]},
+	{"rule_id": 2, "rule_name": "ec_host", "steps": [
+		{"op": "set_chooseleaf_tries", "num": 5},
+		{"op": "take", "item": -2, "item_name": "default~hdd"},
+		{"op": "chooseleaf_indep", "num": 0, "type": "host"},
+		{"op": "emit"}
+	]},
+	{"rule_id": 3, "rule_name": "zone_host", "steps": [
+		{"op": "take", "item": -1, "item_name": "default"},
+		{"op": "choose_firstn", "num": 0, "type": "zone"},
+		{"op": "chooseleaf_firstn", "num": 2, "type": "host"},
+		{"op": "emit"}
+	]},
+	{"rule_id": 4, "rule_name": "replicated_rack", "steps": [
+		{"op": "take", "item": -1, "item_name": "default"},
+		{"op": "chooseleaf_firstn", "num": 0, "type": "rack"},
+		{"op": "emit"}
+	]},
+	{"rule_id": 5, "rule_name": "no_choose", "steps": [
+		{"op": "take", "item": 0, "item_name": "osd.0"},
+		{"op": "emit"}
+	]},
+	{"rule_id": 6, "rule_name": "replicated_datacenter", "steps": [
+		{"op": "take", "item": -1, "item_name": "default"},
+		{"op": "chooseleaf_firstn", "num": 0, "type": "datacenter"},
+		{"op": "emit"}
+	]}
+]`
+
+func Test_poolsFailureDomain(t *testing.T) {
+	var rules []cephclient.CrushRule
+	assert.NoError(t, json.Unmarshal([]byte(testCrushRules), &rules))
+
+	// a CRUSH tree with the types osd (0), host (1), rack (3), zone (10) and root (11), but no
+	// datacenter
+	var osdTree cephclient.OsdTree
+	assert.NoError(t, json.Unmarshal([]byte(`{"nodes": [
+		{"id": -1, "name": "default", "type": "root", "type_id": 11, "children": [-2]},
+		{"id": -2, "name": "zone-a", "type": "zone", "type_id": 10, "children": [-3]},
+		{"id": -3, "name": "rack-a", "type": "rack", "type_id": 3, "children": [-4]},
+		{"id": -4, "name": "host-a", "type": "host", "type_id": 1, "children": [0]},
+		{"id": 0, "name": "osd.0", "type": "osd", "type_id": 0}
+	]}`), &osdTree))
+	tree := newCrushTree(osdTree)
+
+	tests := []struct {
+		name      string
+		poolRules map[string]string
+		want      string
+		wantErr   bool
+	}{
+		{"no pools", nil, "", false},
+		{"replicated and EC pools across hosts", map[string]string{"a": "replicated_host", "b": "ec_host"}, "host", false},
+		{"pool across zones and hosts", map[string]string{"a": "zone_host"}, "host", false},
+		{"pool across racks", map[string]string{"a": "replicated_rack"}, "rack", false},
+		{"narrowest of racks and hosts", map[string]string{"a": "replicated_rack", "b": "replicated_host"}, "host", false},
+		{"rule without choose step", map[string]string{"a": "no_choose"}, "", false},
+		{"rule without choose step and pool across racks", map[string]string{"a": "no_choose", "b": "replicated_rack"}, "rack", false},
+		{"rule does not exist", map[string]string{"a": "replicated_host", "b": "missing"}, "", true},
+		{"rule with type not in the CRUSH tree", map[string]string{"a": "replicated_datacenter"}, "", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := poolsFailureDomain(tree, rules, tt.poolRules)
+			if tt.wantErr {
+				assert.Error(t, err)
+				return
+			}
+			assert.NoError(t, err)
+			assert.Equal(t, tt.want, got)
+		})
+	}
 }
